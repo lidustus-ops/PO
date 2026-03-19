@@ -1,13 +1,19 @@
 ﻿#include <iostream>
 #include <vector>
-#include <cstdlib>
-#include <ctime>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <iomanip>
+#include <random>
 
 using namespace std;
 
 void fillRandomData(vector<int>& dataVector) {
+    static mt19937 generator(42);
+    uniform_int_distribution<int> distribution(1, 1000);
+
     for (int& element : dataVector)
-        element = rand() % 1000 + 1;
+        element = distribution(generator);
 }
 
 long findXor(const vector<int>& dataVector) {
@@ -21,18 +27,96 @@ long findXor(const vector<int>& dataVector) {
     return xorResult;
 }
 
+void processOptimized(const vector<int>& dataVector, size_t startIndex, size_t endIndex,
+    long& sharedXorResult, mutex& sharedMutex) {
+
+    long localXor = 0;
+
+    for (size_t i = startIndex; i < endIndex; ++i) {
+        if (dataVector[i] % 7 == 0) {
+            localXor ^= dataVector[i];
+        }
+    }
+
+    lock_guard<mutex> lock(sharedMutex);
+    sharedXorResult ^= localXor;
+}
+
+long findXorWithMutex(const vector<int>& dataVector, int totalThreads) {
+    long globalXorResult = 0;
+    mutex resultMutex;
+    vector<thread> workerThreads;
+
+    size_t partitionSize = dataVector.size() / totalThreads;
+
+    for (int t = 0; t < totalThreads; ++t) {
+        size_t startIndex = t * partitionSize;
+        size_t endIndex = (t == totalThreads - 1)
+            ? dataVector.size()
+            : startIndex + partitionSize;
+
+        workerThreads.emplace_back(processOptimized,
+            cref(dataVector), startIndex, endIndex,
+            ref(globalXorResult), ref(resultMutex));
+    }
+
+    for (auto& th : workerThreads)
+        th.join();
+
+    return globalXorResult;
+}
+
 int main() {
-    srand(time(0));
+    vector<size_t> dataSizes = { 100000, 500000, 1000000, 2000000 };
+    vector<int> threadOptions = { 1, 4, 6, 10, 12, 16 };
 
-    size_t currentSize = 100000;
-    vector<int> valuesVector(currentSize);
+    cout << left
+        << setw(10) << "Size"
+        << setw(6) << "Thr"
+        << setw(10) << "Simple"
+        << setw(10) << "Mutex"
+        << " | Check\n";
 
-    fillRandomData(valuesVector);
+    cout << string(45, '-') << endl;
 
-    long result = findXor(valuesVector);
+    using clock_type = chrono::high_resolution_clock;
 
-    cout << "Size: " << currentSize << endl;
-    cout << "Result: " << result << endl;
+    for (size_t currentSize : dataSizes) {
+        vector<int> valuesVector(currentSize);
+        fillRandomData(valuesVector);
+
+        auto startTimeSequential = clock_type::now();
+        long baseResult = findXor(valuesVector);
+        auto endTimeSequential = clock_type::now();
+
+        double durationSimple = chrono::duration<double, milli>(
+            endTimeSequential - startTimeSequential).count();
+
+        for (int threadsCount : threadOptions) {
+            auto startTimeMutex = clock_type::now();
+            long mutexResult = findXorWithMutex(valuesVector, threadsCount);
+            auto endTimeMutex = clock_type::now();
+
+            double durationMutex = chrono::duration<double, milli>(
+                endTimeMutex - startTimeMutex).count();
+
+            bool isCorrect = (baseResult == mutexResult);
+
+            cout << left << setw(10) << currentSize
+                << setw(6) << threadsCount
+                << fixed << setprecision(2);
+
+            if (threadsCount == 1)
+                cout << setw(10) << durationSimple;
+            else
+                cout << setw(10) << "-";
+
+            cout << setw(10) << durationMutex
+                << " | " << (isCorrect ? "Correct" : "Fail") << endl;
+        }
+
+        cout << string(45, '=') << endl;
+    }
 
     return 0;
 }
