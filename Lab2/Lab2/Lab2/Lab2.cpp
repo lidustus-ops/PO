@@ -1,10 +1,12 @@
 ﻿#include <iostream>
 #include <vector>
 #include <thread>
+#include <atomic>
 #include <mutex>
 #include <chrono>
 #include <iomanip>
 #include <random>
+#include <string>
 
 using namespace std;
 
@@ -27,19 +29,14 @@ long findXor(const vector<int>& dataVector) {
     return xorResult;
 }
 
-void processOptimized(const vector<int>& dataVector, size_t startIndex, size_t endIndex,
+void processWithMutex(const vector<int>& dataVector, size_t startIndex, size_t endIndex,
     long& sharedXorResult, mutex& sharedMutex) {
-
-    long localXor = 0;
-
     for (size_t i = startIndex; i < endIndex; ++i) {
         if (dataVector[i] % 7 == 0) {
-            localXor ^= dataVector[i];
+            lock_guard<mutex> lock(sharedMutex);
+            sharedXorResult ^= dataVector[i];
         }
     }
-
-    lock_guard<mutex> lock(sharedMutex);
-    sharedXorResult ^= localXor;
 }
 
 long findXorWithMutex(const vector<int>& dataVector, int totalThreads) {
@@ -51,19 +48,52 @@ long findXorWithMutex(const vector<int>& dataVector, int totalThreads) {
 
     for (int t = 0; t < totalThreads; ++t) {
         size_t startIndex = t * partitionSize;
-        size_t endIndex = (t == totalThreads - 1)
-            ? dataVector.size()
-            : startIndex + partitionSize;
+        size_t endIndex = (t == totalThreads - 1) ? dataVector.size() : startIndex + partitionSize;
 
-        workerThreads.emplace_back(processOptimized,
+        workerThreads.emplace_back(processWithMutex,
             cref(dataVector), startIndex, endIndex,
             ref(globalXorResult), ref(resultMutex));
     }
 
-    for (auto& th : workerThreads)
-        th.join();
+    for (auto& currentThread : workerThreads)
+        currentThread.join();
 
     return globalXorResult;
+}
+
+void processWithCAS(const vector<int>& dataVector, size_t startIndex, size_t endIndex,
+    atomic<long>& sharedAtomicResult) {
+    for (size_t i = startIndex; i < endIndex; ++i) {
+        if (dataVector[i] % 7 == 0) {
+            long expectedValue, desiredValue;
+
+            do {
+                expectedValue = sharedAtomicResult.load();
+                desiredValue = expectedValue ^ dataVector[i];
+            } while (!sharedAtomicResult.compare_exchange_strong(expectedValue, desiredValue));
+        }
+    }
+}
+
+long findXorWithCAS(const vector<int>& dataVector, int totalThreads) {
+    atomic<long> globalAtomicResult(0);
+    vector<thread> workerThreads;
+
+    size_t partitionSize = dataVector.size() / totalThreads;
+
+    for (int t = 0; t < totalThreads; ++t) {
+        size_t startIndex = t * partitionSize;
+        size_t endIndex = (t == totalThreads - 1) ? dataVector.size() : startIndex + partitionSize;
+
+        workerThreads.emplace_back(processWithCAS,
+            cref(dataVector), startIndex, endIndex,
+            ref(globalAtomicResult));
+    }
+
+    for (auto& currentThread : workerThreads)
+        currentThread.join();
+
+    return globalAtomicResult.load();
 }
 
 int main() {
@@ -75,9 +105,10 @@ int main() {
         << setw(6) << "Thr"
         << setw(10) << "Simple"
         << setw(10) << "Mutex"
+        << setw(10) << "CAS"
         << " | Check\n";
 
-    cout << string(45, '-') << endl;
+    cout << string(55, '-') << endl;
 
     using clock_type = chrono::high_resolution_clock;
 
@@ -89,18 +120,22 @@ int main() {
         long baseResult = findXor(valuesVector);
         auto endTimeSequential = clock_type::now();
 
-        double durationSimple = chrono::duration<double, milli>(
-            endTimeSequential - startTimeSequential).count();
+        double durationSimple = chrono::duration<double, milli>(endTimeSequential - startTimeSequential).count();
 
         for (int threadsCount : threadOptions) {
             auto startTimeMutex = clock_type::now();
             long mutexResult = findXorWithMutex(valuesVector, threadsCount);
             auto endTimeMutex = clock_type::now();
 
-            double durationMutex = chrono::duration<double, milli>(
-                endTimeMutex - startTimeMutex).count();
+            double durationMutex = chrono::duration<double, milli>(endTimeMutex - startTimeMutex).count();
 
-            bool isCorrect = (baseResult == mutexResult);
+            auto startTimeCAS = clock_type::now();
+            long casResult = findXorWithCAS(valuesVector, threadsCount);
+            auto endTimeCAS = clock_type::now();
+
+            double durationCAS = chrono::duration<double, milli>(endTimeCAS - startTimeCAS).count();
+
+            bool isCorrect = (baseResult == mutexResult && baseResult == casResult);
 
             cout << left << setw(10) << currentSize
                 << setw(6) << threadsCount
@@ -112,10 +147,11 @@ int main() {
                 cout << setw(10) << "-";
 
             cout << setw(10) << durationMutex
+                << setw(10) << durationCAS
                 << " | " << (isCorrect ? "Correct" : "Fail") << endl;
         }
 
-        cout << string(45, '=') << endl;
+        cout << string(55, '=') << endl;
     }
 
     return 0;
