@@ -21,6 +21,9 @@ struct DataHeader {
 struct ClientSession {
     vector<vector<int>> matrix;
     int threads_to_use = 1;
+    bool is_ready = false;
+    bool is_busy = false;
+    double last_duration = 0.0;
 };
 
 int receive_all(SOCKET sock, char* buffer, int length) {
@@ -51,7 +54,7 @@ void handle_client(SOCKET client_socket) {
     char command;
     int client_id = (int)client_socket;
 
-    cout << "Client connected. Socket: " << client_id << endl;
+    cout << "New connection. Socket ID: " << client_id << endl;
 
     while (recv(client_socket, &command, 1, 0) > 0) {
         if (command == '1') {
@@ -62,6 +65,9 @@ void handle_client(SOCKET client_socket) {
             session.threads_to_use = ntohl(h.thread_count);
             int bytes = ntohl(h.payload_size);
 
+            cout << "Client " << client_id << " sent matrix " << n << "x" << n
+                << " (Threads: " << session.threads_to_use << ")" << endl;
+
             vector<int> flat(n * n);
             if (receive_all(client_socket, (char*)flat.data(), bytes) < 0) break;
 
@@ -71,13 +77,21 @@ void handle_client(SOCKET client_socket) {
                     session.matrix[i][j] = ntohl(flat[i * n + j]);
                 }
             }
-            send(client_socket, "A", 1, 0); 
+
+            session.is_ready = false;
+            send(client_socket, "A", 1, 0);
         }
-        else if (command == '2') { 
+        else if (command == '2') {
             if (session.matrix.empty()) {
+                cout << "Client " << client_id << " tried to compute without data!" << endl;
                 send(client_socket, "E", 1, 0);
                 continue;
             }
+
+            cout << "Starting calculation for Client " << client_id << "..." << endl;
+            session.is_busy = true;
+
+            auto start_time = high_resolution_clock::now();
 
             int n = (int)session.matrix.size();
             int t_cnt = max(1, session.threads_to_use);
@@ -93,27 +107,68 @@ void handle_client(SOCKET client_socket) {
             }
 
             for (auto& w : workers) w.join();
+
+            auto end_time = high_resolution_clock::now();
+            session.last_duration = duration_cast<microseconds>(end_time - start_time).count() / 1000.0;
+
+            session.is_busy = false;
+            session.is_ready = true;
+            cout << "Computation done in " << session.last_duration << " ms." << endl;
             send(client_socket, "A", 1, 0);
-            cout << "Client " << client_id << " computation finished." << endl;
         }
-        else if (command == '5') break; 
+        else if (command == '3') {
+            char status = session.is_busy ? 'P' : (session.is_ready ? 'R' : 'I');
+            send(client_socket, &status, 1, 0);
+        }
+        else if (command == '4') {
+            if (!session.is_ready) {
+                cout << "Client " << client_id << " requested result before computation!" << endl;
+                send(client_socket, "E", 1, 0);
+                continue;
+            }
+
+            cout << "Sending result matrix to Client " << client_id << endl;
+            send(client_socket, "G", 1, 0);
+
+            send(client_socket, (char*)&session.last_duration, sizeof(double), 0);
+
+            uint32_t n = (uint32_t)session.matrix.size();
+            uint32_t net_len = htonl(n * n * sizeof(int));
+            send(client_socket, (char*)&net_len, 4, 0);
+
+            for (auto& row : session.matrix) {
+                for (int val : row) {
+                    int net_v = htonl(val);
+                    send(client_socket, (char*)&net_v, 4, 0);
+                }
+            }
+        }
+        else if (command == '5') {
+            cout << "Client " << client_id << " requested disconnect." << endl;
+            break;
+        }
     }
 
-    cout << "Closing connection for " << client_id << endl;
+    cout << "Connection closed for Client " << client_id << endl;
     closesocket(client_socket);
 }
 
 int main() {
     WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 
     SOCKET srv = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr = { AF_INET, htons(8080), INADDR_ANY };
 
-    bind(srv, (sockaddr*)&addr, sizeof(addr));
+    if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        cout << "Bind failed!" << endl;
+        return 1;
+    }
+
     listen(srv, SOMAXCONN);
 
-    cout << "Server (v2) started on port 8080" << endl;
+    cout << "       Server started on port: 8080" << endl;
+    cout << "       Waiting for connections..." << endl;
 
     while (true) {
         SOCKET cl = accept(srv, nullptr, nullptr);
